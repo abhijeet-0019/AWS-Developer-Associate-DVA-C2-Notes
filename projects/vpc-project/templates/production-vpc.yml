@@ -1,0 +1,428 @@
+# CloudFormation template that codifies the full production VPC footprint so it can be recreated consistently
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Highly available VPC with public/private subnets, ALB, NAT Gateways, and Auto Scaling group
+  for application servers running in private subnets.
+
+# -------- Parameters control reusable inputs so stacks can be customized per environment --------
+Parameters:
+  # Network range that defines the overall VPC boundary
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+  # Smaller slice of the VPC space used for the first public subnet
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the first public subnet.
+  # Second public subnet so the load balancer can span two AZs
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the second public subnet.
+  # Private subnet in AZ1 where application instances live
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+    Description: CIDR block for the first private subnet.
+  # Private subnet in AZ2 for redundancy
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.12.0/24
+    Description: CIDR block for the second private subnet.
+  # User-supplied AZ keeps the template flexible across regions
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First Availability Zone (for example, us-east-1a).
+  # Second AZ ensures high availability for subnets and ASG
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second Availability Zone (for example, us-east-1b).
+  # Existing EC2 key pair allows break-glass SSH via Session Manager/bastion
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair to enable SSH into the bastion or private hosts.
+  # Instance size for the Auto Scaling group so cost/perf can be tuned
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t4g.micro
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+    Description: Instance type for Auto Scaling group.
+  # Target number of application instances during steady state
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Desired capacity for Auto Scaling group.
+  # Lower bound so scaling never drops below this many instances
+  MinCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum number of instances for Auto Scaling group.
+  # Upper safety limit to control spend during scale-out
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: Maximum number of instances for Auto Scaling group.
+
+# -------- Optional mapping that fetches the latest Amazon Linux 2023 AMI via SSM parameter --------
+Mappings:
+  AmiMap:
+    AL2023:
+      Id: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+# -------- Core network resources (VPC, subnets, routing, NAT gateways) --------
+Resources:
+  # Creates the isolated virtual network where every other resource resides
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: production-vpc
+
+  # Internet gateway provides outbound path for public resources
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: production-igw
+
+  # Attach the gateway to the VPC so routing can leverage it
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # First public subnet places ALB/NAT in AZ1
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-subnet-az1
+
+  # Second public subnet mirrors the first in AZ2
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-subnet-az2
+
+  # Private compute network in AZ1 (no public IPs)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-subnet-az1
+
+  # Private compute network in AZ2
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-subnet-az2
+
+  # Routing table that hands 0.0.0.0/0 traffic to the internet gateway for public subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: public-rt
+
+  # Default route enabling outbound internet for the public subnets
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn: InternetGatewayAttachment
+
+  # Link public subnet AZ1 to the shared public route table
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # Same association for the second public subnet
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Elastic IP that the NAT gateway in AZ1 uses for egress
+  NatEipAz1:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: nat-eip-az1
+
+  # Elastic IP for the AZ2 NAT gateway
+  NatEipAz2:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: nat-eip-az2
+
+  # Managed NAT gateway keeps private instances hidden while allowing outbound requests (AZ1)
+  NatGatewayAz1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipAz1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: nat-az1
+
+  # Second NAT gateway for AZ2 to avoid cross-AZ data charges
+  NatGatewayAz2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipAz2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: nat-az2
+
+  # Route table dedicated to private subnet AZ1
+  PrivateRouteTableAz1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: private-rt-az1
+
+  # Route table for private subnet AZ2
+  PrivateRouteTableAz2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: private-rt-az2
+
+  # Default route for private subnet AZ1 targets the local NAT gateway
+  PrivateRouteAz1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableAz1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayAz1
+
+  # Same default route but for AZ2
+  PrivateRouteAz2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableAz2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayAz2
+
+  # Apply the AZ1 private route table to the AZ1 private subnet
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTableAz1
+
+  # Apply the AZ2 private route table to the AZ2 private subnet
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTableAz2
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # Public-facing ALB needs to accept HTTP from the internet
+      GroupDescription: Allow inbound HTTP from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: alb-sg
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # Application instances only trust the ALB, preventing direct public access
+      GroupDescription: Allow HTTP traffic from ALB and outbound to anywhere
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: app-sg
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      # Internet-facing ALB spans both public subnets for high availability
+      Name: production-alb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Type: application
+      IpAddressType: ipv4
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Target group tells the ALB where to forward traffic (private instances)
+      Name: production-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200-399'
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      # Listener binds port 80 on the ALB to the target group action
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      # Launch template defines how private instances boot (AMI, instance type, userdata, security)
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:${AmiMap.AL2023.Id}}}'
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: false
+            DeviceIndex: 0
+            Groups:
+              - !Ref InstanceSecurityGroup
+        UserData: !Base64 |
+          # Simple bootstrap script keeps demo self-verifying by serving a page via nginx
+          #!/bin/bash
+          dnf update -y
+          dnf install -y nginx
+          echo "<h1>Production VPC App - $(hostname)</h1>" > /usr/share/nginx/html/index.html
+          systemctl enable nginx
+          systemctl start nginx
+      TagSpecifications:
+        - ResourceType: instance
+          Tags:
+            - Key: Name
+              Value: private-app-instance
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      # Target the private subnets so instances stay off the public internet
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      DesiredCapacity: !Ref DesiredCapacity
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - Key: Name
+          Value: private-app-instance
+          PropagateAtLaunch: true
+
+# -------- Outputs expose essential identifiers for downstream stacks or manual checks --------
+Outputs:
+  VpcId:
+    Description: ID of the created VPC
+    Value: !Ref VPC
+    Export:
+      Name: production-vpc-id
+  PublicSubnetIds:
+    Description: Public subnet IDs (comma-separated)
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+  PrivateSubnetIds:
+    Description: Private subnet IDs (comma-separated)
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+  LoadBalancerDNSName:
+    Description: DNS name of the application load balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling group
+    Value: !Ref AutoScalingGroup

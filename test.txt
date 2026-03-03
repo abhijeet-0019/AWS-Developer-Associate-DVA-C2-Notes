@@ -1,1 +1,217 @@
 hello!
+Improve the current 3D cricket bowling game with the following corrections.
+
+---
+
+# 1️⃣ Stump Scale & Presence
+
+### Problem:
+
+Stumps are still too small and visually weak.
+
+### Fix:
+
+* Increase stump height by 40–60%.
+* Increase stump thickness slightly.
+* Make bails clearly visible.
+* Ensure stumps are readable from bowler POV.
+* Adjust camera slightly closer if needed.
+
+Stumps must feel like a real target.
+
+---
+
+# 2️⃣ Real Collision System (CRITICAL)
+
+Currently:
+All stumps fly even if one is hit.
+
+This is incorrect.
+
+### Required Behavior:
+
+Each element must have separate physics bodies:
+
+* Left stump
+* Middle stump
+* Right stump
+* Two bails
+
+### Collision Logic:
+
+* If ball hits only left stump → only left stump falls.
+* If ball hits middle + right → only those two fall.
+* If ball touches only bails → only bails fall.
+* No global explosion effect.
+
+Use realistic impulse force based on ball velocity.
+
+---
+
+# 3️⃣ Proper Bounce Physics (MAJOR FIX)
+
+Currently:
+Ball always hits base of stumps.
+Bounce visually negligible.
+
+This breaks realism.
+
+---
+
+## Correct Physics Model
+
+Ball trajectory must depend on:
+
+* Launch angle (vertical)
+* Launch power (velocity magnitude)
+* Gravity constant
+
+### Expected Realistic Behavior:
+
+If player drags LESS (low power):
+→ Ball pitches closer to bowler
+→ Bounce height is HIGHER when reaching stumps
+
+If player drags MORE (high power):
+→ Ball pitches closer to stumps
+→ Bounce is LOW and flatter
+
+This must feel physically correct.
+
+---
+
+## Bounce Mechanics Requirements:
+
+* Ball must visibly compress slightly at pitch contact.
+* Ball must clearly change vertical direction after bounce.
+* Bounce height should depend on impact velocity.
+
+No fixed bounce height.
+
+---
+
+# 4️⃣ Visible Pitch Contact Indicator
+
+Currently unclear where ball pitches.
+
+Add:
+
+* Subtle dust puff or small ground impact mark
+  OR
+* Slight color flash on pitch at bounce point
+
+Keep minimal. No arcade particles.
+
+Player must SEE where ball pitched.
+
+---
+
+# 5️⃣ Spin Direction Bug Fix (IMPORTANT)
+
+Current bug:
+Indicator says Right → Ball spins Left.
+Indicator says Left → Ball spins Right.
+
+Fix coordinate system.
+
+Spin direction must match indicator:
+
+If indicator shows:
+→ 8° LEFT
+Ball horizontal direction after bounce must shift LEFT from bowler perspective.
+
+Double-check world coordinate orientation.
+
+---
+
+# 6️⃣ Spin Magnitude Adjustment
+
+Spin appears weak because:
+
+* Stumps too far
+* Bounce negligible
+* Camera too wide
+
+After fixing bounce + scale:
+
+* Ensure 10° spin produces visibly noticeable deviation.
+* Spin must apply rotation to horizontal velocity vector AFTER bounce.
+* Do not exaggerate unrealistically.
+
+---
+
+# 7️⃣ Stop Auto Base Hit Behavior
+
+Currently:
+Ball always hits bottom of stumps.
+
+That means vertical collision logic is wrong.
+
+Fix:
+
+* Stumps must have full vertical collision bodies.
+* Ball must be able to hit:
+
+  * Lower stump
+  * Middle section
+  * Upper section
+  * Bails
+
+Impact height must depend on bounce height.
+
+---
+
+# 8️⃣ Impact Sound Design
+
+Add realistic sound effects:
+
+When ball hits stump:
+
+* Sharp wooden crack sound
+* Slight wood scatter sound
+* Slight reverb
+
+When ball hits pitch:
+
+* Subtle leather thud sound
+
+When ball misses:
+
+* No dramatic sound
+
+Keep sound minimal and clean.
+
+---
+
+# 9️⃣ Physics Correction Summary
+
+Ensure:
+
+* Real gravity
+* True projectile motion
+* Velocity-based bounce
+* Accurate collision detection
+* Per-object physics response
+* Spin only after bounce
+* Spin direction correctly mapped
+
+No fake animation-based movement.
+
+---
+
+# 🔥 End Goal
+
+When playing, it must feel like:
+
+"I can control length."
+
+When I drag lightly:
+Ball lands short → bounces high → may go over stumps.
+
+When I drag strongly:
+Ball lands fuller → skids lower → hits middle stump.
+
+When I see 12° Left:
+I can plan line accordingly.
+
+That’s skill-based bowling.
